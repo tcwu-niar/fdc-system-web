@@ -1,11 +1,42 @@
+import io
 import re
 from pathlib import Path
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="Cobra 100 FDC 分析系統", layout="wide")
-st.title("Oxford PlasmaPro 100 Cobra - FDC 圖表分析系統 (免金鑰版)")
+st.set_page_config(
+    page_title="Cobra FDC 分析系統",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# 徹底隱藏側邊欄與收合按鈕
+st.markdown(
+    """
+    <style>
+        [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {
+            display: none !important;
+        }
+        .block-container { padding-top: 2rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# 最外層 FDC 資料夾之 Google Drive ID 與常見本機同步路徑
+GDRIVE_FDC_ROOT_ID = "1JkFRZpoB_HJaQlevo5tPGgnjPBWPu69g"
+LOCAL_CANDIDATES = [
+    Path("FDC"),
+    Path("G:/我的雲端硬碟/FDC"),
+    Path("G:/My Drive/FDC"),
+]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 
 PRIORITY_FDC_COLS = [
     "Table AMU DCBias",
@@ -26,16 +57,99 @@ PRIORITY_FDC_COLS = [
     "Chamber Heater Temperature",
 ]
 
-def parse_filename_info(file_name: str):
-    """解析 'LOT4-11F0 - 20260907 - 11-20-11.csv' 檔名中的批號與時間"""
+# ================= 檔名解析：自動分離 Wafer ID 與下貨日期時間 =================
+def parse_wafer_and_datetime(file_name: str):
+    """支援 'LOT4-11F0 - 20260907 - 11-20-11.csv' 或 '20260907_112011_LOT4-11F0.csv' 等格式"""
     stem = Path(file_name).stem
-    m = re.match(r"^(.*?)\s*-\s*(\d{8})\s*-\s*(\d{2}-\d{2}-\d{2})$", stem)
+    dt_pattern = r"(20\d{2}[-_]?\d{2}[-_]?\d{2})\s*[-_ ]*\s*(\d{2}[-_:]?\d{2}[-_:]?\d{2})"
+    m = re.search(dt_pattern, stem)
     if m:
-        lot_id, d_str, t_str = m.groups()
-        run_dt = pd.to_datetime(f"{d_str} {t_str.replace('-', ':')}", format="%Y%m%d %H:%M:%S")
-        return lot_id.strip(), run_dt
-    return stem, pd.Timestamp.now()
+        raw_d, raw_t = m.groups()
+        d_clean = re.sub(r"[-_]", "", raw_d)
+        t_clean = re.sub(r"[-_:]", "", raw_t)
+        run_dt = pd.to_datetime(f"{d_clean} {t_clean}", format="%Y%m%d %H%M%S", errors="coerce")
 
+        # 扣除日期時間後，剩餘字串即為 Wafer ID
+        wafer_part = f"{stem[:m.start()]} {stem[m.end():]}".strip()
+        wafer_id = re.sub(r"^[\s\-_]+|[\s\-_]+$", "", wafer_part) or stem
+        if pd.notna(run_dt):
+            return wafer_id, run_dt
+    return stem, pd.NaT
+
+# ================= 資料來源讀取（支援雲端公開連結 & 本機同步資料夾） =================
+def get_local_root() -> Path | None:
+    for p in LOCAL_CANDIDATES:
+        if p.exists() and p.is_dir():
+            return p
+    return None
+
+@st.cache_data(ttl=120, show_spinner=False)
+def list_gdrive_children(folder_id: str) -> list[dict]:
+    """免金鑰讀取 Google Drive 資料夾內的子資料夾與檔案清單"""
+    url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    if resp.status_code != 200:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    items = []
+    for entry in soup.select("div.flip-entry"):
+        entry_id = entry.get("id", "")
+        if not entry_id.startswith("entry-"):
+            continue
+        item_id = entry_id.replace("entry-", "", 1)
+        title_el = entry.select_one("div.flip-entry-title")
+        link_el = entry.select_one("a[href]")
+        if not title_el or not link_el:
+            continue
+        name = title_el.get_text(strip=True)
+        href = link_el.get("href", "")
+        items.append({
+            "id": item_id,
+            "name": name,
+            "type": "folder" if "/folders/" in href else "file",
+        })
+    return items
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_gdrive_csv_bytes(file_id: str) -> bytes:
+    session = requests.Session()
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    resp = session.get(url, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    if b"confirm=" in resp.content and b"<html" in resp.content[:200].lower():
+        soup = BeautifulSoup(resp.text, "html.parser")
+        form = soup.find("form", {"id": "download-form"})
+        if form and form.get("action"):
+            params = {i.get("name"): i.get("value") for i in form.find_all("input") if i.get("name")}
+            resp = session.get(form["action"], params=params, headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+    return resp.content
+
+def list_subfolders(parent_ref: str, is_local: bool) -> dict[str, str]:
+    if is_local:
+        folders = [p for p in sorted(Path(parent_ref).iterdir()) if p.is_dir()]
+        return {p.name: str(p) for p in folders}
+    items = list_gdrive_children(parent_ref)
+    folders = sorted([x for x in items if x["type"] == "folder"], key=lambda x: x["name"])
+    return {x["name"]: x["id"] for x in folders}
+
+def list_recipe_csvs(recipe_ref: str, is_local: bool) -> list[dict]:
+    raw_files = []
+    if is_local:
+        for p in Path(recipe_ref).glob("*.csv"):
+            wafer_id, run_dt = parse_wafer_and_datetime(p.name)
+            raw_files.append({"ref": str(p), "name": p.name, "wafer_id": wafer_id, "run_dt": run_dt})
+    else:
+        for x in list_gdrive_children(recipe_ref):
+            if x["type"] == "file" and x["name"].lower().endswith(".csv"):
+                wafer_id, run_dt = parse_wafer_and_datetime(x["name"])
+                raw_files.append({"ref": x["id"], "name": x["name"], "wafer_id": wafer_id, "run_dt": run_dt})
+
+    raw_files.sort(key=lambda item: (pd.isna(item["run_dt"]), item["run_dt"], item["name"]))
+    return raw_files
+
+# ================= 製程步階偵測與統計計算 =================
 def detect_plasma_steps(df: pd.DataFrame, icp_thresh: float, bias_thresh: float, min_step_sec: float = 2.0):
     icp_on = df["ICP RF Forward Power"] > icp_thresh if "ICP RF Forward Power" in df.columns else False
     rf_on = df["Table RF Forward Power"] > bias_thresh if "Table RF Forward Power" in df.columns else False
@@ -52,32 +166,49 @@ def detect_plasma_steps(df: pd.DataFrame, icp_thresh: float, bias_thresh: float,
     return step_labels
 
 @st.cache_data(show_spinner=False)
-def process_raw_csv(file_bytes: bytes, file_name: str, recipe_tag: str, icp_thresh: float, bias_thresh: float, trim_start: float, trim_end: float):
-    df = pd.read_csv(pd.io.common.BytesIO(file_bytes))
+def load_and_analyze_csv(
+    file_ref: str, file_name: str, is_local: bool,
+    icp_thresh: float, bias_thresh: float, trim_start: float, trim_end: float
+):
+    if is_local:
+        df = pd.read_csv(file_ref)
+    else:
+        raw_bytes = fetch_gdrive_csv_bytes(file_ref)
+        df = pd.read_csv(io.BytesIO(raw_bytes))
+
     if "Time" not in df.columns or df.empty:
-        return [], None, None
+        return [], pd.DataFrame()
 
-    lot_id, run_time = parse_filename_info(file_name)
-    run_label = f"{run_time.strftime('%Y/%m/%d %H:%M')} | {lot_id}"
+    wafer_id, run_dt = parse_wafer_and_datetime(file_name)
+    dt_str = run_dt.strftime("%Y/%m/%d %H:%M:%S") if pd.notna(run_dt) else "未標示時間"
+    short_dt = run_dt.strftime("%m/%d %H:%M") if pd.notna(run_dt) else file_name
+    x_label = f"{short_dt} | {wafer_id}"
+
     df["Step_Auto"] = detect_plasma_steps(df, icp_thresh, bias_thresh)
-
     sensor_cols = [c for c in df.select_dtypes(include="number").columns if c != "Time"]
-    rows = []
-    for step_name, grp in df.groupby("Step_Auto"):
+
+    # 同時計算「全製程 (All Data)」與「各電漿步階 (Plasma Step)」統計值
+    groups = [("All Process (全區段)", df)] + list(df.groupby("Step_Auto"))
+    summary_rows = []
+
+    for step_name, grp in groups:
         t_rel = grp["Time"] - grp["Time"].iloc[0]
         dur = float(t_rel.iloc[-1])
-        steady = grp[(t_rel >= trim_start) & (t_rel <= dur - trim_end)] if dur > (trim_start + trim_end) else grp
+        if step_name.startswith("Plasma Step") and dur > (trim_start + trim_end):
+            steady = grp[(t_rel >= trim_start) & (t_rel <= dur - trim_end)]
+        else:
+            steady = grp
 
         for col in sensor_cols:
             s = steady[col].dropna()
             if not s.empty:
-                rows.append({
-                    "Recipe": recipe_tag,
-                    "Run_Label": run_label,
-                    "Lot_ID": lot_id,
-                    "Run_Time": str(run_time),
+                summary_rows.append({
+                    "X_Label": x_label,
+                    "Wafer_ID": wafer_id,
+                    "Run_DateTime": dt_str,
+                    "Sort_Time": run_dt,
                     "Step": step_name,
-                    "Step_Duration_s": round(dur, 2),
+                    "Duration_s": round(dur, 2),
                     "Parameter": col,
                     "Mean": float(s.mean()),
                     "Max": float(s.max()),
@@ -85,123 +216,148 @@ def process_raw_csv(file_bytes: bytes, file_name: str, recipe_tag: str, icp_thre
                     "Std": float(s.std()),
                 })
 
-    # 降採樣 0.1 秒供單片曲線快速疊圖
-    trace_df = df.iloc[::10].copy()
-    return rows, run_label, trace_df
+    trace_df = df.iloc[::10].copy()  # 0.1 秒取樣供單片疊圖
+    return summary_rows, trace_df
 
-# ================= 側邊欄：上傳與參數控制 =================
-with st.sidebar:
-    st.header("📂 1. 匯入製程 Log 檔")
-    st.markdown("可從 [Google 雲端 FDC 資料夾](https://drive.google.com/drive/folders/1JkFRZpoB_HJaQlevo5tPGgnjPBWPu69g) 或隨身碟將 `.csv` 拖拉至此：")
+# ================= 主畫面標題與重新整理列 =================
+title_col, btn_col = st.columns([5, 1])
+title_col.title("📈 Oxford Cobra FDC 製程監控儀表板")
+if btn_col.button("🔄 重新同步目錄", use_container_width=True):
+    st.cache_data.clear()
 
-    recipe_input = st.text_input("指定這批檔案的 Recipe 名稱", value="TSVET1")
-    uploaded_logs = st.file_uploader(
-        "選擇或拖曳多個機台 CSV 檔 (可多選)",
-        type=["csv"],
-        accept_multiple_files=True,
+local_root = get_local_root()
+is_local_mode = local_root is not None
+root_ref = str(local_root) if is_local_mode else GDRIVE_FDC_ROOT_ID
+
+# 讀取第二層：機台編號 (Tool ID)
+tool_map = list_subfolders(root_ref, is_local_mode)
+if not tool_map:
+    st.warning(
+        "尚未讀取到雲端 `FDC` 下的機台資料夾。請確認：\n"
+        "1. 已將 Google 雲端 `FDC` 資料夾右鍵「共用」設為 **「知道連結的任何人 ➔ 檢視者」**，設定後點擊右上角「🔄 重新同步目錄」。\n"
+        "2. 若於辦公室電腦本機執行且不開放公開連結，請安裝 Google Drive 電腦版並確認路徑為 `G:/我的雲端硬碟/FDC`。"
     )
-
-    st.divider()
-    st.header("📜 2. 載入歷史 FDC 總表 (選用)")
-    hist_file = st.file_uploader("上傳先前匯出的 FDC_History.csv", type=["csv"])
-
-    st.divider()
-    st.header("⚙️ 3. 步階與暫態過濾")
-    icp_th = st.number_input("電漿啟動 ICP Power 門檻 (W)", value=20.0, step=5.0)
-    bias_th = st.number_input("電漿啟動 Table RF 門檻 (W)", value=5.0, step=1.0)
-    trim_s = st.number_input("濾除步階開頭暫態 (秒)", min_value=0.0, value=3.0, step=0.5)
-    trim_e = st.number_input("濾除步階結尾暫態 (秒)", min_value=0.0, value=1.0, step=0.5)
-
-# 整合上傳的原始 CSV 與歷史總表
-summary_list = []
-traces_dict = {}
-
-if hist_file is not None:
-    hist_df = pd.read_csv(hist_file)
-    summary_list.append(hist_df)
-
-if uploaded_logs:
-    new_rows = []
-    for up_f in uploaded_logs:
-        rows, r_lbl, t_df = process_raw_csv(
-            up_f.getvalue(), up_f.name, recipe_input.strip() or "Default",
-            icp_th, bias_th, trim_s, trim_e
-        )
-        if rows:
-            new_rows.extend(rows)
-            traces_dict[r_lbl] = t_df
-    if new_rows:
-        summary_list.append(pd.DataFrame(new_rows))
-
-if not summary_list:
-    st.info("👈 請從左側欄拖曳上傳機台匯出的 `.csv` 檔案（支援一次框選多個檔案），即可立即產生 FDC 圖表！")
     st.stop()
 
-fdc_df = pd.concat(summary_list, ignore_index=True)
-fdc_df["Run_Time"] = pd.to_datetime(fdc_df["Run_Time"])
-# 自動去除重複匯入的相同紀錄
-fdc_df = fdc_df.drop_duplicates(subset=["Recipe", "Run_Label", "Step", "Parameter"], keep="last")
+# ================= 核心三段式選單：機台 ➔ Recipe ➔ FDC Item =================
+col_tool, col_recipe, col_item = st.columns(3)
 
-# 提供一鍵下載合併後的歷史總表，方便存回 Google 雲端
-with st.sidebar:
-    st.divider()
-    csv_export = fdc_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "💾 下載最新 FDC_History.csv 總表",
-        data=csv_export,
-        file_name="FDC_History.csv",
-        mime="text/csv",
-        use_container_width=True,
+sel_tool = col_tool.selectbox("1️⃣ 選擇機台編號 (Tool ID)", list(tool_map.keys()))
+
+# 讀取第三層：該機台下的 Process Recipe
+recipe_map = list_subfolders(tool_map[sel_tool], is_local_mode)
+if not recipe_map:
+    st.info(f"機台 `{sel_tool}` 資料夾內目前沒有任何 Process Recipe 子資料夾。")
+    st.stop()
+
+sel_recipe = col_recipe.selectbox("2️⃣ 選擇 Process Recipe", list(recipe_map.keys()))
+
+# 進階運算設定（預設收合於主畫面，保持版面清爽）
+with st.expander("⚙️ 步階區段、管制界線 (UCL/LCL) 與暫態過濾設定", expanded=False):
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    sel_stat = s1.selectbox("統計特徵值", ["Mean", "Max", "Min", "Std"])
+    ucl = s2.number_input("上限 UCL (0=隱藏)", value=0.0)
+    lcl = s3.number_input("下限 LCL (0=隱藏)", value=0.0)
+    icp_th = s4.number_input("ICP 點火門檻 (W)", value=20.0, step=5.0)
+    trim_s = s5.number_input("切除開頭暫態 (秒)", min_value=0.0, value=3.0, step=0.5)
+    trim_e = s6.number_input("切除結尾暫態 (秒)", min_value=0.0, value=1.0, step=0.5)
+
+# 讀取第四層：撈取該 Recipe 下所有 CSV 並解析檔名與數據
+csv_list = list_recipe_csvs(recipe_map[sel_recipe], is_local_mode)
+if not csv_list:
+    st.info(f"`{sel_tool} / {sel_recipe}` 資料夾內目前沒有 `.csv` 檔案。")
+    st.stop()
+
+all_summary = []
+traces_dict = {}
+prog = st.progress(0, text=f"正在載入 {sel_recipe} 共 {len(csv_list)} 片 Wafer 紀錄...")
+for i, f_info in enumerate(csv_list):
+    rows, t_df = load_and_analyze_csv(
+        f_info["ref"], f_info["name"], is_local_mode, icp_th, 5.0, trim_s, trim_e
     )
+    if rows:
+        all_summary.extend(rows)
+        traces_dict[rows[0]["X_Label"]] = t_df
+    prog.progress((i + 1) / len(csv_list))
+prog.empty()
 
-# ================= 頂部篩選選單 =================
-c1, c2, c3, c4 = st.columns(4)
-sel_recipe = c1.selectbox("1. 選擇 Recipe", sorted(fdc_df["Recipe"].unique()))
-df_rec = fdc_df[fdc_df["Recipe"] == sel_recipe]
+fdc_df = pd.DataFrame(all_summary)
+if fdc_df.empty:
+    st.error("CSV 檔案內容格式不符（缺少 Time 或數值欄位）。")
+    st.stop()
 
-steps = sorted(df_rec["Step"].unique())
-default_step_idx = next((i for i, s in enumerate(steps) if s.startswith("Plasma Step 1")), 0)
-sel_step = c2.selectbox("2. 選擇製程區段", steps, index=default_step_idx)
+# 將 FDC Item 填入第三個主選單
+avail_params = fdc_df["Parameter"].unique().tolist()
+ordered_params = [p for p in PRIORITY_FDC_COLS if p in avail_params] + [
+    p for p in avail_params if p not in PRIORITY_FDC_COLS
+]
+sel_item = col_item.selectbox("3️⃣ 選擇 FDC Item (監控參數)", ordered_params)
 
-avail_params = df_rec["Parameter"].unique().tolist()
-ordered_params = [p for p in PRIORITY_FDC_COLS if p in avail_params] + [p for p in avail_params if p not in PRIORITY_FDC_COLS]
-sel_param = c3.selectbox("3. 選擇 FDC 監控項目", ordered_params)
-sel_stat = c4.selectbox("4. 統計特徵值", ["Mean", "Max", "Min", "Std"])
+# 步階快速切換按鈕列（預設優先選 Plasma Step 1 主製程區段）
+avail_steps = sorted(fdc_df["Step"].unique())
+default_step = next((s for s in avail_steps if s == "Plasma Step 1"), avail_steps[0])
+sel_step = st.radio(
+    "製程區段篩選：",
+    options=avail_steps,
+    index=avail_steps.index(default_step),
+    horizontal=True,
+)
 
-chart_df = df_rec[(df_rec["Step"] == sel_step) & (df_rec["Parameter"] == sel_param)].sort_values("Run_Time")
+plot_df = fdc_df[(fdc_df["Step"] == sel_step) & (fdc_df["Parameter"] == sel_item)].sort_values(
+    by=["Sort_Time", "Wafer_ID"], na_position="last"
+)
 
-u_col, l_col = st.columns(2)
-ucl = u_col.number_input("上限 UCL (填 0 不顯示)", value=0.0)
-lcl = l_col.number_input("下限 LCL (填 0 不顯示)", value=0.0)
-
-# ================= 圖表 1：跨批次 FDC 趨勢管制圖 =================
-st.subheader(f"📊 FDC 趨勢管制圖：{sel_recipe} | {sel_step} | {sel_param} ({sel_stat})")
+# ================= 圖表一：FDC 趨勢管制圖 =================
+st.subheader(f"📊 FDC Chart：{sel_tool} ▸ {sel_recipe} ▸ {sel_item} ({sel_stat})")
 fig_fdc = px.line(
-    chart_df, x="Run_Label", y=sel_stat, markers=True,
-    hover_data=["Lot_ID", "Run_Time", "Step_Duration_s", "Mean", "Max", "Min", "Std"],
+    plot_df,
+    x="X_Label",
+    y=sel_stat,
+    markers=True,
+    hover_data={
+        "Wafer_ID": True,
+        "Run_DateTime": True,
+        "Duration_s": True,
+        "Mean": ":.3f",
+        "Max": ":.3f",
+        "Min": ":.3f",
+        "Std": ":.3f",
+        "X_Label": False,
+    },
 )
 if ucl != 0.0:
     fig_fdc.add_hline(y=ucl, line_dash="dash", line_color="red", annotation_text=f"UCL ({ucl})")
 if lcl != 0.0:
     fig_fdc.add_hline(y=lcl, line_dash="dash", line_color="red", annotation_text=f"LCL ({lcl})")
-fig_fdc.update_layout(xaxis_tickangle=-35, height=420)
+fig_fdc.update_layout(xaxis_title="下貨日期時間 | Wafer ID", xaxis_tickangle=-30, height=430)
 st.plotly_chart(fig_fdc, use_container_width=True)
 
-# ================= 圖表 2：單片每秒曲線疊圖 =================
-if traces_dict:
-    st.subheader(f"🔍 單片原始曲線比對 (Trace Overlay)：{sel_param}")
-    avail_traces = [r for r in chart_df["Run_Label"].tolist() if r in traces_dict]
-    sel_runs = st.multiselect("勾選要疊圖比對的片號", options=avail_traces, default=avail_traces[-2:])
+# ================= 圖表二 & Wafer 明細分頁 =================
+tab_trace, tab_table = st.tabs(["🔍 單片原始曲線疊圖 (Trace Chart)", "📋 已讀取 Wafer 日期時間與統計明細"])
 
-    if sel_runs:
-        t_frames = []
-        for r_lbl in sel_runs:
-            t_df = traces_dict[r_lbl][["Time", "Step_Auto", sel_param]].copy()
-            t_df["Run_Label"] = r_lbl
-            t_frames.append(t_df)
+with tab_trace:
+    wafer_options = plot_df["X_Label"].tolist()
+    sel_wafers = st.multiselect(
+        "選擇要疊圖比對的 Wafer（預設顯示最新 2 片）：",
+        options=wafer_options,
+        default=wafer_options[-2:],
+    )
+    if sel_wafers:
+        t_list = []
+        for w_lbl in sel_wafers:
+            sub_t = traces_dict[w_lbl][["Time", "Step_Auto", sel_item]].copy()
+            sub_t["Wafer"] = w_lbl
+            t_list.append(sub_t)
         fig_trace = px.line(
-            pd.concat(t_frames, ignore_index=True),
-            x="Time", y=sel_param, color="Run_Label", hover_data=["Step_Auto"]
+            pd.concat(t_list, ignore_index=True),
+            x="Time",
+            y=sel_item,
+            color="Wafer",
+            hover_data=["Step_Auto"],
         )
-        fig_trace.update_layout(height=420)
+        fig_trace.update_layout(xaxis_title="Time (sec)", height=420)
         st.plotly_chart(fig_trace, use_container_width=True)
+
+with tab_table:
+    display_cols = ["Run_DateTime", "Wafer_ID", "Step", "Duration_s", "Mean", "Max", "Min", "Std"]
+    st.dataframe(plot_df[display_cols], use_container_width=True, hide_index=True)
