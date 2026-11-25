@@ -8,25 +8,55 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(
-    page_title="Cobra FDC 分析系統",
+    page_title="Oxford Cobra FDC 製程監控儀表板",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# 徹底隱藏側邊欄與收合按鈕
+# 隱藏側邊欄、設定 16pt 主標題與手機響應式 (RWD) 樣式
 st.markdown(
     """
     <style>
         [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {
             display: none !important;
         }
-        .block-container { padding-top: 2rem; }
+        .block-container {
+            padding-top: 1.5rem !important;
+            padding-bottom: 2rem !important;
+            max-width: 100% !important;
+        }
+        .main-title {
+            font-size: 16pt !important;
+            font-weight: 600 !important;
+            line-height: 1.4 !important;
+            margin: 0 0 0.5rem 0 !important;
+            padding: 0 !important;
+        }
+        .section-title {
+            font-size: 13pt !important;
+            font-weight: 600 !important;
+            line-height: 1.4 !important;
+            margin: 1rem 0 0.4rem 0 !important;
+        }
+        /* 手機與平板窄螢幕最佳化 */
+        @media (max-width: 768px) {
+            .block-container {
+                padding-left: 0.75rem !important;
+                padding-right: 0.75rem !important;
+                padding-top: 1rem !important;
+            }
+            .main-title {
+                margin-bottom: 0.25rem !important;
+            }
+            div[data-testid="stHorizontalBlock"] {
+                gap: 0.5rem !important;
+            }
+        }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# 最外層 FDC 資料夾之 Google Drive ID 與常見本機同步路徑
 GDRIVE_FDC_ROOT_ID = "1JkFRZpoB_HJaQlevo5tPGgnjPBWPu69g"
 LOCAL_CANDIDATES = [
     Path("FDC"),
@@ -59,7 +89,6 @@ PRIORITY_FDC_COLS = [
 
 # ================= 檔名解析：自動分離 Wafer ID 與下貨日期時間 =================
 def parse_wafer_and_datetime(file_name: str):
-    """支援 'LOT4-11F0 - 20260907 - 11-20-11.csv' 或 '20260907_112011_LOT4-11F0.csv' 等格式"""
     stem = Path(file_name).stem
     dt_pattern = r"(20\d{2}[-_]?\d{2}[-_]?\d{2})\s*[-_ ]*\s*(\d{2}[-_:]?\d{2}[-_:]?\d{2})"
     m = re.search(dt_pattern, stem)
@@ -69,14 +98,13 @@ def parse_wafer_and_datetime(file_name: str):
         t_clean = re.sub(r"[-_:]", "", raw_t)
         run_dt = pd.to_datetime(f"{d_clean} {t_clean}", format="%Y%m%d %H%M%S", errors="coerce")
 
-        # 扣除日期時間後，剩餘字串即為 Wafer ID
         wafer_part = f"{stem[:m.start()]} {stem[m.end():]}".strip()
         wafer_id = re.sub(r"^[\s\-_]+|[\s\-_]+$", "", wafer_part) or stem
         if pd.notna(run_dt):
             return wafer_id, run_dt
     return stem, pd.NaT
 
-# ================= 資料來源讀取（支援雲端公開連結 & 本機同步資料夾） =================
+# ================= 資料來源讀取 =================
 def get_local_root() -> Path | None:
     for p in LOCAL_CANDIDATES:
         if p.exists() and p.is_dir():
@@ -85,7 +113,6 @@ def get_local_root() -> Path | None:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def list_gdrive_children(folder_id: str) -> list[dict]:
-    """免金鑰讀取 Google Drive 資料夾內的子資料夾與檔案清單"""
     url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
     resp = requests.get(url, headers=HEADERS, timeout=20)
     if resp.status_code != 200:
@@ -187,7 +214,6 @@ def load_and_analyze_csv(
     df["Step_Auto"] = detect_plasma_steps(df, icp_thresh, bias_thresh)
     sensor_cols = [c for c in df.select_dtypes(include="number").columns if c != "Time"]
 
-    # 同時計算「全製程 (All Data)」與「各電漿步階 (Plasma Step)」統計值
     groups = [("All Process (全區段)", df)] + list(df.groupby("Step_Auto"))
     summary_rows = []
 
@@ -216,56 +242,55 @@ def load_and_analyze_csv(
                     "Std": float(s.std()),
                 })
 
-    trace_df = df.iloc[::10].copy()  # 0.1 秒取樣供單片疊圖
+    trace_df = df.iloc[::10].copy()
     return summary_rows, trace_df
 
-# ================= 主畫面標題與重新整理列 =================
+# ================= 頂部標題與同步按鈕 =================
 title_col, btn_col = st.columns([5, 1])
-title_col.title("📈 Oxford Cobra FDC 製程監控儀表板")
-if btn_col.button("🔄 重新同步目錄", use_container_width=True):
-    st.cache_data.clear()
+with title_col:
+    st.markdown('<div class="main-title">Oxford Cobra FDC 製程監控儀表板</div>', unsafe_allow_html=True)
+with btn_col:
+    if st.button("重新同步目錄", use_container_width=True):
+        st.cache_data.clear()
 
 local_root = get_local_root()
 is_local_mode = local_root is not None
 root_ref = str(local_root) if is_local_mode else GDRIVE_FDC_ROOT_ID
 
-# 讀取第二層：機台編號 (Tool ID)
 tool_map = list_subfolders(root_ref, is_local_mode)
 if not tool_map:
     st.warning(
-        "尚未讀取到雲端 `FDC` 下的機台資料夾。請確認：\n"
-        "1. 已將 Google 雲端 `FDC` 資料夾右鍵「共用」設為 **「知道連結的任何人 ➔ 檢視者」**，設定後點擊右上角「🔄 重新同步目錄」。\n"
-        "2. 若於辦公室電腦本機執行且不開放公開連結，請安裝 Google Drive 電腦版並確認路徑為 `G:/我的雲端硬碟/FDC`。"
+        "尚未讀取到雲端 FDC 下的機台資料夾。請確認已將 Google 雲端 FDC 資料夾共用設為「知道連結的任何人 (檢視者)」，設定後點擊「重新同步目錄」。"
     )
     st.stop()
 
-# ================= 核心三段式選單：機台 ➔ Recipe ➔ FDC Item =================
+# ================= 三段式主選單（桌面橫排、手機自動垂直堆疊） =================
 col_tool, col_recipe, col_item = st.columns(3)
 
-sel_tool = col_tool.selectbox("1️⃣ 選擇機台編號 (Tool ID)", list(tool_map.keys()))
+sel_tool = col_tool.selectbox("1. 選擇機台編號 (Tool ID)", list(tool_map.keys()))
 
-# 讀取第三層：該機台下的 Process Recipe
 recipe_map = list_subfolders(tool_map[sel_tool], is_local_mode)
 if not recipe_map:
-    st.info(f"機台 `{sel_tool}` 資料夾內目前沒有任何 Process Recipe 子資料夾。")
+    st.info(f"機台 {sel_tool} 資料夾內目前沒有任何 Process Recipe 子資料夾。")
     st.stop()
 
-sel_recipe = col_recipe.selectbox("2️⃣ 選擇 Process Recipe", list(recipe_map.keys()))
+sel_recipe = col_recipe.selectbox("2. 選擇 Process Recipe", list(recipe_map.keys()))
 
-# 進階運算設定（預設收合於主畫面，保持版面清爽）
-with st.expander("⚙️ 步階區段、管制界線 (UCL/LCL) 與暫態過濾設定", expanded=False):
-    s1, s2, s3, s4, s5, s6 = st.columns(6)
-    sel_stat = s1.selectbox("統計特徵值", ["Mean", "Max", "Min", "Std"])
-    ucl = s2.number_input("上限 UCL (0=隱藏)", value=0.0)
-    lcl = s3.number_input("下限 LCL (0=隱藏)", value=0.0)
-    icp_th = s4.number_input("ICP 點火門檻 (W)", value=20.0, step=5.0)
-    trim_s = s5.number_input("切除開頭暫態 (秒)", min_value=0.0, value=3.0, step=0.5)
-    trim_e = s6.number_input("切除結尾暫態 (秒)", min_value=0.0, value=1.0, step=0.5)
+# 進階運算設定：改為兩列三欄，確保平板與手機畫面不擠壓
+with st.expander("步階區段、管制界線 (UCL/LCL) 與暫態過濾設定", expanded=False):
+    r1_c1, r1_c2, r1_c3 = st.columns(3)
+    sel_stat = r1_c1.selectbox("統計特徵值", ["Mean", "Max", "Min", "Std"])
+    ucl = r1_c2.number_input("上限 UCL (0=隱藏)", value=0.0)
+    lcl = r1_c3.number_input("下限 LCL (0=隱藏)", value=0.0)
 
-# 讀取第四層：撈取該 Recipe 下所有 CSV 並解析檔名與數據
+    r2_c1, r2_c2, r2_c3 = st.columns(3)
+    icp_th = r2_c1.number_input("ICP 點火門檻 (W)", value=20.0, step=5.0)
+    trim_s = r2_c2.number_input("切除開頭暫態 (秒)", min_value=0.0, value=3.0, step=0.5)
+    trim_e = r2_c3.number_input("切除結尾暫態 (秒)", min_value=0.0, value=1.0, step=0.5)
+
 csv_list = list_recipe_csvs(recipe_map[sel_recipe], is_local_mode)
 if not csv_list:
-    st.info(f"`{sel_tool} / {sel_recipe}` 資料夾內目前沒有 `.csv` 檔案。")
+    st.info(f"{sel_tool} / {sel_recipe} 資料夾內目前沒有 .csv 檔案。")
     st.stop()
 
 all_summary = []
@@ -286,14 +311,12 @@ if fdc_df.empty:
     st.error("CSV 檔案內容格式不符（缺少 Time 或數值欄位）。")
     st.stop()
 
-# 將 FDC Item 填入第三個主選單
 avail_params = fdc_df["Parameter"].unique().tolist()
 ordered_params = [p for p in PRIORITY_FDC_COLS if p in avail_params] + [
     p for p in avail_params if p not in PRIORITY_FDC_COLS
 ]
-sel_item = col_item.selectbox("3️⃣ 選擇 FDC Item (監控參數)", ordered_params)
+sel_item = col_item.selectbox("3. 選擇 FDC Item (監控參數)", ordered_params)
 
-# 步階快速切換按鈕列（預設優先選 Plasma Step 1 主製程區段）
 avail_steps = sorted(fdc_df["Step"].unique())
 default_step = next((s for s in avail_steps if s == "Plasma Step 1"), avail_steps[0])
 sel_step = st.radio(
@@ -307,8 +330,13 @@ plot_df = fdc_df[(fdc_df["Step"] == sel_step) & (fdc_df["Parameter"] == sel_item
     by=["Sort_Time", "Wafer_ID"], na_position="last"
 )
 
+PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
+
 # ================= 圖表一：FDC 趨勢管制圖 =================
-st.subheader(f"📊 FDC Chart：{sel_tool} ▸ {sel_recipe} ▸ {sel_item} ({sel_stat})")
+st.markdown(
+    f'<div class="section-title">FDC Chart：{sel_tool} / {sel_recipe} / {sel_item} ({sel_stat})</div>',
+    unsafe_allow_html=True,
+)
 fig_fdc = px.line(
     plot_df,
     x="X_Label",
@@ -329,11 +357,19 @@ if ucl != 0.0:
     fig_fdc.add_hline(y=ucl, line_dash="dash", line_color="red", annotation_text=f"UCL ({ucl})")
 if lcl != 0.0:
     fig_fdc.add_hline(y=lcl, line_dash="dash", line_color="red", annotation_text=f"LCL ({lcl})")
-fig_fdc.update_layout(xaxis_title="下貨日期時間 | Wafer ID", xaxis_tickangle=-30, height=430)
-st.plotly_chart(fig_fdc, use_container_width=True)
+
+fig_fdc.update_layout(
+    xaxis_title="下貨日期時間 | Wafer ID",
+    xaxis_tickangle=-35,
+    xaxis=dict(automargin=True, tickfont=dict(size=11)),
+    yaxis=dict(automargin=True, tickfont=dict(size=11)),
+    margin=dict(l=10, r=10, t=20, b=40),
+    height=380,
+)
+st.plotly_chart(fig_fdc, use_container_width=True, config=PLOTLY_CONFIG)
 
 # ================= 圖表二 & Wafer 明細分頁 =================
-tab_trace, tab_table = st.tabs(["🔍 單片原始曲線疊圖 (Trace Chart)", "📋 已讀取 Wafer 日期時間與統計明細"])
+tab_trace, tab_table = st.tabs(["單片原始曲線疊圖 (Trace Chart)", "已讀取 Wafer 日期時間與統計明細"])
 
 with tab_trace:
     wafer_options = plot_df["X_Label"].tolist()
@@ -355,8 +391,16 @@ with tab_trace:
             color="Wafer",
             hover_data=["Step_Auto"],
         )
-        fig_trace.update_layout(xaxis_title="Time (sec)", height=420)
-        st.plotly_chart(fig_trace, use_container_width=True)
+        # 圖例置於圖表上方橫排，避免在手機窄螢幕擠壓曲線寬度
+        fig_trace.update_layout(
+            xaxis_title="Time (sec)",
+            xaxis=dict(automargin=True, tickfont=dict(size=11)),
+            yaxis=dict(automargin=True, tickfont=dict(size=11)),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text=""),
+            margin=dict(l=10, r=10, t=35, b=35),
+            height=380,
+        )
+        st.plotly_chart(fig_trace, use_container_width=True, config=PLOTLY_CONFIG)
 
 with tab_table:
     display_cols = ["Run_DateTime", "Wafer_ID", "Step", "Duration_s", "Mean", "Max", "Min", "Std"]
