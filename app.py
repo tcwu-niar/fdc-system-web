@@ -100,9 +100,24 @@ ALL_KNOWN_FDC_COLS = PRIORITY_FDC_COLS + [
     "Cl2 Flow",
 ]
 
-PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
+# 啟用滑鼠滾輪縮放 (scrollZoom)，雙擊圖表可自動復原預設比例
+PLOTLY_CONFIG = {"displaylogo": False, "responsive": True, "scrollZoom": True}
 MAX_WORKERS = 12
 _thread_local = threading.local()
+
+
+# ================= 座標軸預設範圍計算輔助函式 =================
+def calc_ padded_bounds(series: pd.Series) -> tuple[float, float]:
+    """根據資料自動計算上下留白 5% 的預設座標範圍"""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return 0.0, 100.0
+    vmin, vmax = float(s.min()), float(s.max())
+    if vmin == vmax:
+        pad = abs(vmin) * 0.1 if vmin != 0 else 1.0
+        return round(vmin - pad, 4), round(vmax + pad, 4)
+    pad = (vmax - vmin) * 0.05
+    return round(vmin - pad, 4), round(vmax + pad, 4)
 
 
 # ================= 執行緒安全之高速連線池 =================
@@ -272,11 +287,6 @@ def detect_plasma_steps(
     icp_step_diff: float = 50.0,
     bias_step_diff: float = 10.0,
 ) -> pd.Series:
-    """
-    同時支援：
-    1. 步階間關閉 RF 再重開（即使前後步階功率相同也會切開）
-    2. 不斷火直接升降 ICP 或 Table RF 功率（自動濾除中間斜坡爬升段並切分為不同 Step）
-    """
     n_rows = len(df)
     if n_rows == 0:
         return pd.Series(dtype=str)
@@ -303,14 +313,12 @@ def detect_plasma_steps(
     if not pd.notna(dt) or dt <= 0:
         dt = 0.01
 
-    # 以約 0.4 秒視窗做中位數平滑濾除突波，並以約 1.0 秒視窗偵測斜坡爬升率
     win_smooth = max(3, int(round(0.4 / dt)))
     win_slope = max(3, int(round(1.0 / dt)))
 
     icp_smooth = icp.rolling(win_smooth, center=True, min_periods=1).median()
     rf_smooth = rf.rolling(win_smooth, center=True, min_periods=1).median()
 
-    # 1 秒內功率變化小於門檻視為穩定平台（自動排除斜坡爬升過渡期）
     icp_stable = icp_smooth.diff(win_slope).abs().fillna(0.0) < max(12.0, icp_step_diff * 0.3)
     rf_stable = rf_smooth.diff(win_slope).abs().fillna(0.0) < max(4.0, bias_step_diff * 0.3)
     is_plateau = is_plasma & icp_stable & rf_stable
@@ -328,7 +336,6 @@ def detect_plasma_steps(
         cur_icp = float(icp_smooth.loc[grp_idx].median())
         cur_rf = float(rf_smooth.loc[grp_idx].median())
 
-        # 檢查與上一段平台之間是否曾關閉電漿超過 0.5 秒
         was_off_between = False
         if prev_end_pos is not None and start_pos > prev_end_pos + 1:
             off_count = int((~is_plasma.iloc[prev_end_pos + 1 : start_pos]).sum())
@@ -347,7 +354,6 @@ def detect_plasma_steps(
         labels.loc[grp_idx] = f"Plasma Step {plasma_idx}"
         prev_end_pos = end_pos
 
-    # 備援：若整段皆為連續動態斜坡而無穩定平台，退回以電漿開啟區間切分
     if plasma_idx == 0:
         on_block = is_plasma.ne(is_plasma.shift()).cumsum()
         p_idx = 1
@@ -505,6 +511,19 @@ def batch_load_traces_parallel(tasks: list[dict], is_local: bool, icp_th: float 
     return results
 
 
+# ================= 修正函式名稱拼字並統一呼叫 =================
+def get_padded_bounds(series: pd.Series) -> tuple[float, float]:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return 0.0, 100.0
+    vmin, vmax = float(s.min()), float(s.max())
+    if vmin == vmax:
+        pad = abs(vmin) * 0.1 if vmin != 0 else 1.0
+        return round(vmin - pad, 4), round(vmax + pad, 4)
+    pad = (vmax - vmin) * 0.05
+    return round(vmin - pad, 4), round(vmax + pad, 4)
+
+
 # ================= 頂部標題與同步按鈕 =================
 title_col, btn_col = st.columns([5, 1])
 with title_col:
@@ -529,7 +548,7 @@ page_fdc, page_overlay = st.tabs(["FDC 趨勢監控", "跨 Recipe 疊 Log 圖"])
 
 
 # =====================================================================
-# 頁面一：FDC 趨勢監控（起始選擇皆為空白）
+# 頁面一：FDC 趨勢監控（起始選擇皆為空白 + 支援自訂 Scale）
 # =====================================================================
 with page_fdc:
     col_tool, col_recipe, col_item = st.columns(3)
@@ -625,10 +644,26 @@ with page_fdc:
                         (fdc_df["Step"] == sel_step) & (fdc_df["Parameter"] == sel_item)
                     ].sort_values(by=["Sort_Time", "Wafer_ID"], na_position="last")
 
+                    # FDC Chart 標題與 Y 軸 Scale 手動調整列
                     st.markdown(
                         f'<div class="section-title">FDC Chart：{sel_tool} / {sel_recipe} / {sel_item} ({sel_stat})</div>',
                         unsafe_allow_html=True,
                     )
+
+                    def_ymin, def_ymax = get_padded_bounds(plot_df[sel_stat])
+                    scale_ctx = f"{sel_tool}_{sel_recipe}_{sel_item}_{sel_step}_{sel_stat}"
+
+                    sc1, sc2, sc3 = st.columns([1.2, 1.5, 1.5])
+                    custom_fdc_y = sc1.checkbox("手動調整 Y 軸 Scale", value=False, key=f"fdc_cy_{scale_ctx}")
+                    fdc_y_range = None
+                    if custom_fdc_y:
+                        fdc_ymin = sc2.number_input("Y 軸下限 (Min)", value=def_ymin, format="%.4f", key=f"fdc_ymin_{scale_ctx}")
+                        fdc_ymax = sc3.number_input("Y 軸上限 (Max)", value=def_ymax, format="%.4f", key=f"fdc_ymax_{scale_ctx}")
+                        if fdc_ymin < fdc_ymax:
+                            fdc_y_range = [fdc_ymin, fdc_ymax]
+                        else:
+                            st.warning("Y 軸下限必須小於上限。")
+
                     fig_fdc = px.line(
                         plot_df,
                         x="X_Label",
@@ -654,7 +689,7 @@ with page_fdc:
                         xaxis_title="下貨日期時間 | Wafer ID",
                         xaxis_tickangle=-35,
                         xaxis=dict(automargin=True, tickfont=dict(size=11)),
-                        yaxis=dict(automargin=True, tickfont=dict(size=11)),
+                        yaxis=dict(automargin=True, tickfont=dict(size=11), range=fdc_y_range),
                         margin=dict(l=10, r=10, t=20, b=40),
                         height=380,
                     )
@@ -683,8 +718,26 @@ with page_fdc:
                                     sub_t["Wafer"] = w_lbl
                                     t_list.append(sub_t)
                             if t_list:
+                                merged_sub = pd.concat(t_list, ignore_index=True)
+                                t_xmin_def, t_xmax_def = float(merged_sub["Time"].min()), float(merged_sub["Time"].max())
+                                t_ymin_def, t_ymax_def = get_padded_bounds(merged_sub[sel_item])
+                                tr_ctx = f"subtr_{sel_tool}_{sel_recipe}_{sel_item}"
+
+                                tsc_toggle = st.checkbox("手動調整曲線圖 X / Y 軸 Scale", value=False, key=f"chk_{tr_ctx}")
+                                tr_x_range, tr_y_range = None, None
+                                if tsc_toggle:
+                                    tc1, tc2, tc3, tc4 = st.columns(4)
+                                    tx_min = tc1.number_input("X 軸起始秒數", value=round(t_xmin_def, 1), step=10.0, key=f"xmin_{tr_ctx}")
+                                    tx_max = tc2.number_input("X 軸結束秒數", value=round(t_xmax_def, 1), step=10.0, key=f"xmax_{tr_ctx}")
+                                    ty_min = tc3.number_input("Y 軸下限 (Min)", value=t_ymin_def, format="%.4f", key=f"ymin_{tr_ctx}")
+                                    ty_max = tc4.number_input("Y 軸上限 (Max)", value=t_ymax_def, format="%.4f", key=f"ymax_{tr_ctx}")
+                                    if tx_min < tx_max:
+                                        tr_x_range = [tx_min, tx_max]
+                                    if ty_min < ty_max:
+                                        tr_y_range = [ty_min, ty_max]
+
                                 fig_trace = px.line(
-                                    pd.concat(t_list, ignore_index=True),
+                                    merged_sub,
                                     x="Time",
                                     y=sel_item,
                                     color="Wafer",
@@ -692,8 +745,8 @@ with page_fdc:
                                 )
                                 fig_trace.update_layout(
                                     xaxis_title="Time (sec)",
-                                    xaxis=dict(automargin=True, tickfont=dict(size=11)),
-                                    yaxis=dict(automargin=True, tickfont=dict(size=11)),
+                                    xaxis=dict(automargin=True, tickfont=dict(size=11), range=tr_x_range),
+                                    yaxis=dict(automargin=True, tickfont=dict(size=11), range=tr_y_range),
                                     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text=""),
                                     margin=dict(l=10, r=10, t=35, b=35),
                                     height=380,
@@ -706,8 +759,7 @@ with page_fdc:
 
 
 # =====================================================================
-# 頁面二：跨 Recipe 疊 Log 圖
-# 選擇方式：Tool (單選) / FDC items (單選) / Recipe (複選) / Wafer (複選)，起始值皆為空白
+# 頁面二：跨 Recipe 疊 Log 圖（支援 X / Y 軸自訂 Scale）
 # =====================================================================
 with page_overlay:
     ov_r1_c1, ov_r1_c2 = st.columns(2)
@@ -809,6 +861,24 @@ with page_overlay:
                 unsafe_allow_html=True,
             )
             combined_trace = pd.concat(overlay_frames, ignore_index=True)
+
+            ov_xmin_def, ov_xmax_def = float(combined_trace["Time"].min()), float(combined_trace["Time"].max())
+            ov_ymin_def, ov_ymax_def = get_padded_bounds(combined_trace[ov_item])
+            ov_ctx = f"ov_{ov_tool}_{ov_item}"
+
+            ov_scale_chk = st.checkbox("手動調整 X / Y 軸 Scale", value=False, key=f"chk_{ov_ctx}")
+            ov_x_range, ov_y_range = None, None
+            if ov_scale_chk:
+                oc1, oc2, oc3, oc4 = st.columns(4)
+                ox_min = oc1.number_input("X 軸起始秒數", value=round(ov_xmin_def, 1), step=10.0, key=f"xmin_{ov_ctx}")
+                ox_max = oc2.number_input("X 軸結束秒數", value=round(ov_xmax_def, 1), step=10.0, key=f"xmax_{ov_ctx}")
+                oy_min = oc3.number_input("Y 軸下限 (Min)", value=ov_ymin_def, format="%.4f", key=f"ymin_{ov_ctx}")
+                oy_max = oc4.number_input("Y 軸上限 (Max)", value=ov_ymax_def, format="%.4f", key=f"ymax_{ov_ctx}")
+                if ox_min < ox_max:
+                    ov_x_range = [ox_min, ox_max]
+                if oy_min < oy_max:
+                    ov_y_range = [oy_min, oy_max]
+
             fig_ov = px.line(
                 combined_trace,
                 x="Time",
@@ -819,8 +889,8 @@ with page_overlay:
             fig_ov.update_layout(
                 xaxis_title="Time (sec)",
                 yaxis_title=ov_item,
-                xaxis=dict(automargin=True, tickfont=dict(size=11)),
-                yaxis=dict(automargin=True, tickfont=dict(size=11)),
+                xaxis=dict(automargin=True, tickfont=dict(size=11), range=ov_x_range),
+                yaxis=dict(automargin=True, tickfont=dict(size=11), range=ov_y_range),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text=""),
                 margin=dict(l=10, r=10, t=40, b=40),
                 height=480,
