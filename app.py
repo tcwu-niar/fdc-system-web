@@ -101,13 +101,12 @@ ALL_KNOWN_FDC_COLS = PRIORITY_FDC_COLS + [
 ]
 
 PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
-MAX_WORKERS = 12  # 穩定高速併發數，降低 Google Drive 瞬間限流機率
+MAX_WORKERS = 12
 _thread_local = threading.local()
 
 
 # ================= 執行緒安全之高速連線池 =================
 def get_thread_session() -> requests.Session:
-    """為每個執行緒建立獨立且可複用 TCP 連線的 Session，兼顧極速與執行緒安全"""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
         adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=2)
@@ -119,7 +118,6 @@ def get_thread_session() -> requests.Session:
 
 
 def fast_read_csv(source) -> pd.DataFrame:
-    """優先使用 PyArrow 多核心引擎極速解析 CSV，並自動清理欄位空白"""
     try:
         df = pd.read_csv(source, engine="pyarrow")
     except Exception:
@@ -265,34 +263,104 @@ def get_csv_columns_fast(file_ref: str, is_local: bool) -> list[str]:
         return ALL_KNOWN_FDC_COLS
 
 
-# ================= 製程步階偵測與向量化極速統計（含型別防呆） =================
-def detect_plasma_steps(df: pd.DataFrame, icp_thresh: float, bias_thresh: float, min_step_sec: float = 2.0):
+# ================= 智慧製程步階偵測（支援斷火重開 & 不斷火連續變換功率） =================
+def detect_plasma_steps(
+    df: pd.DataFrame,
+    icp_thresh: float,
+    bias_thresh: float,
+    min_step_sec: float = 2.0,
+    icp_step_diff: float = 50.0,
+    bias_step_diff: float = 10.0,
+) -> pd.Series:
+    """
+    同時支援：
+    1. 步階間關閉 RF 再重開（即使前後步階功率相同也會切開）
+    2. 不斷火直接升降 ICP 或 Table RF 功率（自動濾除中間斜坡爬升段並切分為不同 Step）
+    """
+    n_rows = len(df)
+    if n_rows == 0:
+        return pd.Series(dtype=str)
+
     if "ICP RF Forward Power" in df.columns:
-        icp_on = pd.to_numeric(df["ICP RF Forward Power"], errors="coerce").fillna(0.0) > icp_thresh
+        icp = pd.to_numeric(df["ICP RF Forward Power"], errors="coerce").fillna(0.0).reset_index(drop=True)
     else:
-        icp_on = pd.Series(False, index=df.index)
+        icp = pd.Series(0.0, index=range(n_rows))
 
     if "Table RF Forward Power" in df.columns:
-        rf_on = pd.to_numeric(df["Table RF Forward Power"], errors="coerce").fillna(0.0) > bias_thresh
+        rf = pd.to_numeric(df["Table RF Forward Power"], errors="coerce").fillna(0.0).reset_index(drop=True)
     else:
-        rf_on = pd.Series(False, index=df.index)
+        rf = pd.Series(0.0, index=range(n_rows))
 
-    is_plasma = icp_on | rf_on
+    is_plasma = (icp > icp_thresh) | (rf > bias_thresh)
+    labels = pd.Series("Step 0 (Idle/Gas)", index=range(n_rows))
 
-    block_id = is_plasma.ne(is_plasma.shift()).cumsum()
-    step_labels = pd.Series("Step 0 (Idle/Gas)", index=df.index)
+    if not is_plasma.any():
+        labels.index = df.index
+        return labels
 
-    if is_plasma.any():
-        time_num = pd.to_numeric(df["Time"], errors="coerce")
-        plasma_idx = 1
-        for _, grp_idx in is_plasma[is_plasma].groupby(block_id[is_plasma]).groups.items():
-            t_sub = time_num.loc[grp_idx].dropna()
-            if len(t_sub) >= 2 and (t_sub.iloc[-1] - t_sub.iloc[0]) >= min_step_sec:
-                step_labels.loc[grp_idx] = f"Plasma Step {plasma_idx}"
-                plasma_idx += 1
-    return step_labels
+    t_sec = pd.to_numeric(df["Time"], errors="coerce").ffill().bfill().reset_index(drop=True)
+    dt = float(t_sec.diff().median()) if n_rows > 1 else 0.01
+    if not pd.notna(dt) or dt <= 0:
+        dt = 0.01
+
+    # 以約 0.4 秒視窗做中位數平滑濾除突波，並以約 1.0 秒視窗偵測斜坡爬升率
+    win_smooth = max(3, int(round(0.4 / dt)))
+    win_slope = max(3, int(round(1.0 / dt)))
+
+    icp_smooth = icp.rolling(win_smooth, center=True, min_periods=1).median()
+    rf_smooth = rf.rolling(win_smooth, center=True, min_periods=1).median()
+
+    # 1 秒內功率變化小於門檻視為穩定平台（自動排除斜坡爬升過渡期）
+    icp_stable = icp_smooth.diff(win_slope).abs().fillna(0.0) < max(12.0, icp_step_diff * 0.3)
+    rf_stable = rf_smooth.diff(win_slope).abs().fillna(0.0) < max(4.0, bias_step_diff * 0.3)
+    is_plateau = is_plasma & icp_stable & rf_stable
+
+    raw_block = is_plateau.ne(is_plateau.shift()).cumsum()
+    plasma_idx = 0
+    prev_icp, prev_rf = None, None
+    prev_end_pos = None
+
+    for _, grp_idx in is_plateau[is_plateau].groupby(raw_block[is_plateau]).groups.items():
+        start_pos, end_pos = int(grp_idx[0]), int(grp_idx[-1])
+        if (t_sec.iat[end_pos] - t_sec.iat[start_pos]) < min_step_sec:
+            continue
+
+        cur_icp = float(icp_smooth.loc[grp_idx].median())
+        cur_rf = float(rf_smooth.loc[grp_idx].median())
+
+        # 檢查與上一段平台之間是否曾關閉電漿超過 0.5 秒
+        was_off_between = False
+        if prev_end_pos is not None and start_pos > prev_end_pos + 1:
+            off_count = int((~is_plasma.iloc[prev_end_pos + 1 : start_pos]).sum())
+            if off_count * dt >= 0.5:
+                was_off_between = True
+
+        if (
+            prev_icp is None
+            or was_off_between
+            or abs(cur_icp - prev_icp) >= icp_step_diff
+            or abs(cur_rf - prev_rf) >= bias_step_diff
+        ):
+            plasma_idx += 1
+            prev_icp, prev_rf = cur_icp, cur_rf
+
+        labels.loc[grp_idx] = f"Plasma Step {plasma_idx}"
+        prev_end_pos = end_pos
+
+    # 備援：若整段皆為連續動態斜坡而無穩定平台，退回以電漿開啟區間切分
+    if plasma_idx == 0:
+        on_block = is_plasma.ne(is_plasma.shift()).cumsum()
+        p_idx = 1
+        for _, grp_idx in is_plasma[is_plasma].groupby(on_block[is_plasma]).groups.items():
+            if (t_sec.iat[int(grp_idx[-1])] - t_sec.iat[int(grp_idx[0])]) >= min_step_sec:
+                labels.loc[grp_idx] = f"Plasma Step {p_idx}"
+                p_idx += 1
+
+    labels.index = df.index
+    return labels
 
 
+# ================= 單檔極速統計與降採樣曲線讀取 =================
 @st.cache_data(ttl=3600, show_spinner=False)
 def summarize_single_csv(
     file_ref: str, file_name: str, is_local: bool,
@@ -374,6 +442,11 @@ def load_trace_downsampled(file_ref: str, is_local: bool, icp_thresh: float = 20
     if "Time" not in df.columns or df.empty:
         return pd.DataFrame()
 
+    df["Time"] = pd.to_numeric(df["Time"], errors="coerce")
+    df = df.dropna(subset=["Time"])
+    if df.empty:
+        return pd.DataFrame()
+
     df["Step_Auto"] = detect_plasma_steps(df, icp_thresh, bias_thresh)
     sub = df.iloc[::10].copy()
     float_cols = sub.select_dtypes(include="float64").columns
@@ -382,7 +455,6 @@ def load_trace_downsampled(file_ref: str, is_local: bool, icp_thresh: float = 20
 
 
 def batch_summarize_parallel(csv_list: list[dict], is_local: bool, icp_th: float, bias_th: float, trim_s: float, trim_e: float):
-    """併發載入並容錯隔離異常檔案，不因單一問題檔案中斷整個畫面"""
     all_rows = []
     skipped_files = []
     total = len(csv_list)
