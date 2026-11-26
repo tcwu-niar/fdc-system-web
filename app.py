@@ -107,7 +107,7 @@ _thread_local = threading.local()
 
 
 # ================= 座標軸預設範圍計算輔助函式 =================
-def calc_ padded_bounds(series: pd.Series) -> tuple[float, float]:
+def get_padded_bounds(series: pd.Series) -> tuple[float, float]:
     """根據資料自動計算上下留白 5% 的預設座標範圍"""
     s = pd.to_numeric(series, errors="coerce").dropna()
     if s.empty:
@@ -509,19 +509,6 @@ def batch_load_traces_parallel(tasks: list[dict], is_local: bool, icp_th: float 
             except Exception:
                 results[w_key] = pd.DataFrame()
     return results
-
-
-# ================= 修正函式名稱拼字並統一呼叫 =================
-def get_padded_bounds(series: pd.Series) -> tuple[float, float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if s.empty:
-        return 0.0, 100.0
-    vmin, vmax = float(s.min()), float(s.max())
-    if vmin == vmax:
-        pad = abs(vmin) * 0.1 if vmin != 0 else 1.0
-        return round(vmin - pad, 4), round(vmax + pad, 4)
-    pad = (vmax - vmin) * 0.05
-    return round(vmin - pad, 4), round(vmax + pad, 4)
 
 
 # ================= 頂部標題與同步按鈕 =================
