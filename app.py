@@ -1,5 +1,6 @@
 import io
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import pandas as pd
@@ -100,29 +101,33 @@ ALL_KNOWN_FDC_COLS = PRIORITY_FDC_COLS + [
 ]
 
 PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
-MAX_WORKERS = 16  # 併發下載執行緒數量
+MAX_WORKERS = 12  # 穩定高速併發數，降低 Google Drive 瞬間限流機率
+_thread_local = threading.local()
 
 
-# ================= 建立全域高速連線池 (Connection Pool) =================
-@st.cache_resource
-def get_http_session() -> requests.Session:
-    """複用底層 TCP/SSL 連線，大幅省去每個檔案重複握手的網路延遲"""
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=2)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(HEADERS)
-    return session
+# ================= 執行緒安全之高速連線池 =================
+def get_thread_session() -> requests.Session:
+    """為每個執行緒建立獨立且可複用 TCP 連線的 Session，兼顧極速與執行緒安全"""
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=2)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.headers.update(HEADERS)
+        _thread_local.session = s
+    return _thread_local.session
 
 
 def fast_read_csv(source) -> pd.DataFrame:
-    """優先使用 PyArrow 多核心引擎極速解析 CSV，若未安裝自動退回 C 引擎"""
+    """優先使用 PyArrow 多核心引擎極速解析 CSV，並自動清理欄位空白"""
     try:
-        return pd.read_csv(source, engine="pyarrow")
+        df = pd.read_csv(source, engine="pyarrow")
     except Exception:
         if hasattr(source, "seek"):
             source.seek(0)
-        return pd.read_csv(source, low_memory=False)
+        df = pd.read_csv(source, low_memory=False)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
 # ================= 檔名解析：自動分離 Wafer ID 與下貨日期時間 =================
@@ -153,7 +158,7 @@ def get_local_root() -> Path | None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_gdrive_children(folder_id: str) -> list[dict]:
-    session = get_http_session()
+    session = get_thread_session()
     url = f"https://drive.google.com/embeddedfolderview?id={folder_id}#list"
     resp = session.get(url, timeout=20)
     if resp.status_code != 200:
@@ -181,18 +186,22 @@ def list_gdrive_children(folder_id: str) -> list[dict]:
 
 
 def download_gdrive_bytes_raw(file_id: str) -> bytes:
-    """無快取負擔的純下載函式，供多執行緒高速呼叫"""
-    session = get_http_session()
+    session = get_thread_session()
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     resp = session.get(url, timeout=30)
     resp.raise_for_status()
-    if b"confirm=" in resp.content and b"<html" in resp.content[:200].lower():
+
+    head_lower = resp.content[:300].lower()
+    if b"<html" in head_lower or b"<!doctype html" in head_lower:
         soup = BeautifulSoup(resp.text, "html.parser")
-        form = soup.find("form", {"id": "download-form"})
+        form = soup.find("form", {"id": "download-form"}) or soup.find("form")
         if form and form.get("action"):
             params = {i.get("name"): i.get("value") for i in form.find_all("input") if i.get("name")}
             resp = session.get(form["action"], params=params, timeout=60)
             resp.raise_for_status()
+
+    if b"<html" in resp.content[:300].lower():
+        raise ValueError("Google Drive 暫時回傳驗證頁面而非 CSV 內容")
     return resp.content
 
 
@@ -237,18 +246,18 @@ def list_recipe_csvs(recipe_ref: str, is_local: bool) -> list[dict]:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_csv_columns_fast(file_ref: str, is_local: bool) -> list[str]:
-    """只抓取檔案最開頭 4KB 讀取標題，花費時間 < 0.2 秒"""
     try:
         if is_local:
             df_head = pd.read_csv(file_ref, nrows=3)
         else:
-            session = get_http_session()
+            session = get_thread_session()
             url = f"https://drive.google.com/uc?export=download&id={file_ref}"
             with session.get(url, stream=True, timeout=10) as r:
                 chunk = next(r.iter_content(chunk_size=8192)).decode("utf-8", errors="ignore")
             lines = "\n".join(chunk.splitlines()[:4])
             df_head = pd.read_csv(io.StringIO(lines))
 
+        df_head.columns = [str(c).strip() for c in df_head.columns]
         cols = [c for c in df_head.columns if c != "Time" and not df_head[c].isna().all()]
         ordered = [p for p in ALL_KNOWN_FDC_COLS if p in cols] + [c for c in cols if c not in ALL_KNOWN_FDC_COLS]
         return ordered if ordered else ALL_KNOWN_FDC_COLS
@@ -256,20 +265,31 @@ def get_csv_columns_fast(file_ref: str, is_local: bool) -> list[str]:
         return ALL_KNOWN_FDC_COLS
 
 
-# ================= 製程步階偵測與向量化極速統計 =================
+# ================= 製程步階偵測與向量化極速統計（含型別防呆） =================
 def detect_plasma_steps(df: pd.DataFrame, icp_thresh: float, bias_thresh: float, min_step_sec: float = 2.0):
-    icp_on = df["ICP RF Forward Power"] > icp_thresh if "ICP RF Forward Power" in df.columns else False
-    rf_on = df["Table RF Forward Power"] > bias_thresh if "Table RF Forward Power" in df.columns else False
+    if "ICP RF Forward Power" in df.columns:
+        icp_on = pd.to_numeric(df["ICP RF Forward Power"], errors="coerce").fillna(0.0) > icp_thresh
+    else:
+        icp_on = pd.Series(False, index=df.index)
+
+    if "Table RF Forward Power" in df.columns:
+        rf_on = pd.to_numeric(df["Table RF Forward Power"], errors="coerce").fillna(0.0) > bias_thresh
+    else:
+        rf_on = pd.Series(False, index=df.index)
+
     is_plasma = icp_on | rf_on
 
     block_id = is_plasma.ne(is_plasma.shift()).cumsum()
     step_labels = pd.Series("Step 0 (Idle/Gas)", index=df.index)
 
-    plasma_idx = 1
-    for _, grp in df[is_plasma].groupby(block_id[is_plasma]):
-        if (grp["Time"].iloc[-1] - grp["Time"].iloc[0]) >= min_step_sec:
-            step_labels.loc[grp.index] = f"Plasma Step {plasma_idx}"
-            plasma_idx += 1
+    if is_plasma.any():
+        time_num = pd.to_numeric(df["Time"], errors="coerce")
+        plasma_idx = 1
+        for _, grp_idx in is_plasma[is_plasma].groupby(block_id[is_plasma]).groups.items():
+            t_sub = time_num.loc[grp_idx].dropna()
+            if len(t_sub) >= 2 and (t_sub.iloc[-1] - t_sub.iloc[0]) >= min_step_sec:
+                step_labels.loc[grp_idx] = f"Plasma Step {plasma_idx}"
+                plasma_idx += 1
     return step_labels
 
 
@@ -278,10 +298,6 @@ def summarize_single_csv(
     file_ref: str, file_name: str, is_local: bool,
     icp_thresh: float, bias_thresh: float, trim_start: float, trim_end: float
 ) -> list[dict]:
-    """
-    【極速關鍵】僅計算並快取輕量統計字典（幾 KB），不儲存龐大的原始曲線 DataFrame！
-    計算完立即釋放原始資料記憶體，切換選單 0 延遲。
-    """
     if is_local:
         df = fast_read_csv(file_ref)
     else:
@@ -289,6 +305,11 @@ def summarize_single_csv(
         df = fast_read_csv(io.BytesIO(raw_bytes))
 
     if "Time" not in df.columns or df.empty:
+        return []
+
+    df["Time"] = pd.to_numeric(df["Time"], errors="coerce")
+    df = df.dropna(subset=["Time"])
+    if df.empty:
         return []
 
     wafer_id, run_dt = parse_wafer_and_datetime(file_name)
@@ -306,6 +327,8 @@ def summarize_single_csv(
 
     for step_name, grp in groups:
         t_vals = grp["Time"].to_numpy()
+        if len(t_vals) == 0:
+            continue
         dur = float(t_vals[-1] - t_vals[0])
         if step_name.startswith("Plasma Step") and dur > (trim_start + trim_end):
             t_rel = t_vals - t_vals[0]
@@ -317,11 +340,11 @@ def summarize_single_csv(
         if steady.empty:
             continue
 
-        # 一次性矩陣向量化算出所有欄位的統計值（比逐欄 for 迴圈快 10 倍）
         stats_mat = steady.agg(["mean", "max", "min", "std"])
         for col in sensor_cols:
             mean_val = stats_mat.at["mean", col]
             if pd.notna(mean_val):
+                std_val = stats_mat.at["std", col]
                 summary_rows.append({
                     "File_Ref": file_ref,
                     "X_Label": x_label,
@@ -334,7 +357,7 @@ def summarize_single_csv(
                     "Mean": float(mean_val),
                     "Max": float(stats_mat.at["max", col]),
                     "Min": float(stats_mat.at["min", col]),
-                    "Std": float(stats_mat.at["std", col]) if pd.notna(stats_mat.at["std", col]) else 0.0,
+                    "Std": float(std_val) if pd.notna(std_val) else 0.0,
                 })
 
     return summary_rows
@@ -342,7 +365,6 @@ def summarize_single_csv(
 
 @st.cache_data(ttl=1800, max_entries=30, show_spinner=False)
 def load_trace_downsampled(file_ref: str, is_local: bool, icp_thresh: float = 20.0, bias_thresh: float = 5.0) -> pd.DataFrame:
-    """僅在使用者勾選特定 Wafer 要看疊圖時，才載入該片 0.1s 降採樣曲線"""
     if is_local:
         df = fast_read_csv(file_ref)
     else:
@@ -354,15 +376,15 @@ def load_trace_downsampled(file_ref: str, is_local: bool, icp_thresh: float = 20
 
     df["Step_Auto"] = detect_plasma_steps(df, icp_thresh, bias_thresh)
     sub = df.iloc[::10].copy()
-    # 將浮點數轉為 float32 減少一半記憶體占用
     float_cols = sub.select_dtypes(include="float64").columns
     sub[float_cols] = sub[float_cols].astype("float32")
     return sub
 
 
-def batch_summarize_parallel(csv_list: list[dict], is_local: bool, icp_th: float, bias_th: float, trim_s: float, trim_e: float) -> pd.DataFrame:
-    """使用 16 個執行緒併發下載與計算所有 CSV，將 40 秒等待壓縮至 3~5 秒"""
+def batch_summarize_parallel(csv_list: list[dict], is_local: bool, icp_th: float, bias_th: float, trim_s: float, trim_e: float):
+    """併發載入並容錯隔離異常檔案，不因單一問題檔案中斷整個畫面"""
     all_rows = []
+    skipped_files = []
     total = len(csv_list)
     prog = st.progress(0, text=f"高速併發載入中 (0 / {total} 片 Wafer)...")
 
@@ -374,22 +396,27 @@ def batch_summarize_parallel(csv_list: list[dict], is_local: bool, icp_th: float
             executor.submit(
                 summarize_single_csv,
                 f["ref"], f["name"], is_local, icp_th, bias_th, trim_s, trim_e
-            ): f
+            ): f["name"]
             for f in csv_list
         }
         for future in as_completed(future_map):
-            rows = future.result()
-            if rows:
-                all_rows.extend(rows)
+            f_name = future_map[future]
+            try:
+                rows = future.result()
+                if rows:
+                    all_rows.extend(rows)
+                else:
+                    skipped_files.append(f"{f_name} (無 Time 或有效數值欄位)")
+            except Exception as exc:
+                skipped_files.append(f"{f_name} ({type(exc).__name__})")
             completed += 1
             prog.progress(completed / total, text=f"高速併發載入中 ({completed} / {total} 片 Wafer)...")
 
     prog.empty()
-    return pd.DataFrame(all_rows)
+    return pd.DataFrame(all_rows), skipped_files
 
 
 def batch_load_traces_parallel(tasks: list[dict], is_local: bool, icp_th: float = 20.0) -> dict[str, pd.DataFrame]:
-    """多片曲線疊圖同步併發載入"""
     results = {}
     workers = min(MAX_WORKERS, max(1, len(tasks)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -399,7 +426,10 @@ def batch_load_traces_parallel(tasks: list[dict], is_local: bool, icp_th: float 
         }
         for future in as_completed(future_map):
             w_key = future_map[future]
-            results[w_key] = future.result()
+            try:
+                results[w_key] = future.result()
+            except Exception:
+                results[w_key] = pd.DataFrame()
     return results
 
 
@@ -422,7 +452,7 @@ if not tool_map:
     )
     st.stop()
 
-# ================= 雙頁面導覽（無側邊欄設計） =================
+# ================= 雙頁面導覽 =================
 page_fdc, page_overlay = st.tabs(["FDC 趨勢監控", "跨 Recipe 疊 Log 圖"])
 
 
@@ -484,10 +514,15 @@ with page_fdc:
             )
             st.info(f"{sel_tool} / {sel_recipe} 資料夾內目前沒有 .csv 檔案。")
         else:
-            fdc_df = batch_summarize_parallel(csv_list, is_local_mode, icp_th, 5.0, trim_s, trim_e)
+            fdc_df, skipped = batch_summarize_parallel(csv_list, is_local_mode, icp_th, 5.0, trim_s, trim_e)
+
+            if skipped:
+                with st.expander(f"提示：已自動略過 {len(skipped)} 份格式不符或無數據之檔案", expanded=False):
+                    for msg in skipped:
+                        st.write(f"- {msg}")
 
             if fdc_df.empty:
-                st.error("CSV 檔案內容格式不符（缺少 Time 或數值欄位）。")
+                st.error("找不到可解析的 CSV 數據（請確認檔案內含 Time 與感測器數值欄位）。")
             else:
                 avail_params = fdc_df["Parameter"].unique().tolist()
                 ordered_params = [p for p in PRIORITY_FDC_COLS if p in avail_params] + [
@@ -644,7 +679,6 @@ with page_overlay:
 
     wafer_lookup = {}
     if ov_tool and ov_recipes:
-        # 多個 Recipe 目錄同時併發掃描，不排隊
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(ov_recipes))) as ex:
             rec_futures = {ex.submit(list_recipe_csvs, ov_recipe_map[r], is_local_mode): r for r in ov_recipes}
             rec_results = {rec_futures[f]: f.result() for f in as_completed(rec_futures)}
